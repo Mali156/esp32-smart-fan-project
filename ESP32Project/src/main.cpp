@@ -1,85 +1,188 @@
 #include <Arduino.h>
-#include "FanController.h"
+#include <Wire.h>
+#include "PinConfig.h"
+#include "SharedData.h"
+#include "FanController.h"   // Member A
+#include "SensorModule.h"    // Member B
+#include "DisplayModule.h"   // Member B
+#include "LedModule.h"       // Member B
+#include "ButtonModule.h"    // Member B
 
-// Fan controller instance (PWM pin 16, TACH pin 4, 2 pulses per revolution)
-FanController fan(16, 4, 2.0f);
+// Fan controller (Member A): PWM and TACH pins from PinConfig.h, 2 pulses per revolution
+FanController fan(FAN_PWM_PIN, FAN_TACH_PIN, 2.0f);
 
-// Fan speed state and 1-second telemetry timer
-uint8_t currentDuty = 0;
-unsigned long previousMillis = 0;
-const unsigned long interval = 1000;
+// ---------- Shared data (see SharedData.h) ----------
+int   fanMode = MODE_MANUAL;
+int   fanDuty = 0;
+float fanRPM = 0;
+float targetRPM = 1200;
 
-// Temporary serial speed override (0-100%) until the screen and sensor subsystem is set up
+float temperature = 0;
+float humidity = 0;
+bool  sensorOK = false;
+
+bool   wifiConnected = false;
+String wifiIP = "";
+bool   autoModeReady = false;
+
+#define MAX_TARGET_RPM 5000   // highest PID target allowed
+
+// ---------- Timers ----------
+// RPM is read every 1010 ms (not 1000): fan.getRPM() returns 0 if it is
+// called a little earlier than 1000 ms after the last call.
+unsigned long lastRpmTime = 0;
+unsigned long lastSensorTime = 0;
+unsigned long lastLedTime = 0;
+unsigned long lastDisplayTime = 0;
+
+// ---------- Fan control functions ----------
+
+// Manual mode: set duty 0-100 %
+void setFanDuty(int duty) {
+  duty = constrain(duty, 0, 100);
+  fanMode = MODE_MANUAL;
+  fan.setPIDEnabled(false);
+  fanDuty = duty;
+  fan.setSpeed(fanDuty);
+  Serial.printf("Manual duty: %d%%\n", fanDuty);
+}
+
+// PID mode: set target RPM
+void setTargetRPM(float rpm) {
+  rpm = constrain(rpm, 0, MAX_TARGET_RPM);
+  targetRPM = rpm;
+  fan.setTargetRPM(targetRPM);
+  if (fanMode != MODE_PID) {
+    fanMode = MODE_PID;
+    fan.setPIDEnabled(true);
+  }
+  Serial.printf("PID target: %.0f RPM\n", targetRPM);
+}
+
+// MANUAL -> PID -> AUTO (only when Member C has finished it) -> MANUAL
+void changeMode() {
+  if (fanMode == MODE_MANUAL) {
+    setTargetRPM(targetRPM);
+  } else if (fanMode == MODE_PID && autoModeReady) {
+    fanMode = MODE_AUTO;
+    fan.setPIDEnabled(false);
+    Serial.println("Mode: AUTO");
+  } else {
+    setFanDuty(fanDuty);
+  }
+}
+
+// ---------- I2C scanner (for checking wiring) ----------
+// Runs once at start-up and with the serial command "scan".
+// OLED should be at 0x3C, SHT30 at 0x44 (or 0x45).
+void scanI2C() {
+  Serial.println("Scanning I2C bus (SDA=13, SCL=12)...");
+  int found = 0;
+  for (int address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("  Found device at 0x%02X", address);
+      if (address == 0x3C) Serial.print("  <- OLED");
+      if (address == 0x44 || address == 0x45) Serial.print("  <- SHT30");
+      Serial.println();
+      found++;
+    }
+  }
+  if (found == 0) {
+    Serial.println("  No I2C devices found! Check 3V3, GND, SDA (GPIO 13) and SCL (GPIO 12).");
+  }
+}
+
+// ---------- Serial commands (from Member A, Member D will extend them) ----------
+// "0"-"100" = manual duty, "rpm 1500" = PID target, "scan" = check the I2C bus
 void handleSerialSpeedCommand() {
-    if (Serial.available() > 0) {
-        String input = Serial.readStringUntil('\n');
-        input.trim();
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
 
-        if (input.length() == 0) {
-            return;
-        }
-
-        if (input.startsWith("rpm ") || input.startsWith("RPM ")) {
-            float target = input.substring(4).toFloat();
-            fan.setTargetRPM(target);
-            fan.setPIDEnabled(true);
-            Serial.printf("[Terminal] PID enabled with target RPM: %.1f\n", target);
-            return;
-        }
-
-        bool isNumber = true;
-        size_t startIdx = (input.charAt(0) == '-' || input.charAt(0) == '+') ? 1 : 0;
-        if (startIdx >= input.length()) {
-            isNumber = false;
-        }
-        for (size_t i = startIdx; i < input.length(); i++) {
-            if (!isDigit(input.charAt(i))) {
-                isNumber = false;
-                break;
-            }
-        }
-
-        int requestedDuty = input.toInt();
-        if (isNumber && requestedDuty >= 0 && requestedDuty <= 100) {
-            fan.setPIDEnabled(false);
-            currentDuty = static_cast<uint8_t>(requestedDuty);
-            fan.setSpeed(currentDuty);
-            Serial.printf("[Terminal] Manual fan duty cycle set to %u%%\n", currentDuty);
-        } else {
-            Serial.println("[Terminal] Enter 0-100 for duty cycle or 'rpm <value>' for PID.");
-        }
+    if (input.length() == 0) {
+      return;
     }
+
+    if (input == "scan") {
+      scanI2C();
+      return;
+    }
+
+    if (input.startsWith("rpm ") || input.startsWith("RPM ")) {
+      setTargetRPM(input.substring(4).toFloat());
+      return;
+    }
+
+    bool isNumber = true;
+    for (size_t i = 0; i < input.length(); i++) {
+      if (!isDigit(input.charAt(i))) {
+        isNumber = false;
+      }
+    }
+
+    int requestedDuty = input.toInt();
+    if (isNumber && requestedDuty >= 0 && requestedDuty <= 100) {
+      setFanDuty(requestedDuty);
+    } else {
+      Serial.println("Enter 0-100 for duty cycle, 'rpm <value>' for PID, or 'scan'.");
+    }
+  }
 }
 
-// Initialize serial communication and fan hardware
 void setup() {
-    Serial.begin(115200);
-    delay(1500);
-    Serial.println("Fan Subsystem Initializing...");
+  Serial.begin(115200);
+  delay(1500);
+  Serial.println("Smart Fan Initializing...");
 
-    fan.begin();
-    fan.setPIDGains(0.05f, 0.02f, 0.005f);
-    fan.setSpeed(currentDuty);
+  // Member A: fan
+  fan.begin();
+  fan.setPIDGains(0.05f, 0.02f, 0.005f);
+  fan.setSpeed(fanDuty);
 
-    Serial.printf("Fan set to %u%% duty cycle. Type 0-100 or 'rpm <target>'.\n\n", currentDuty);
+  // Member B: OLED + SHT30 share the I2C pins (SDA=13, SCL=12)
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  scanI2C();
+  initDisplay();
+  initSensor();
+  initLed();
+  initButtons();
 
+  Serial.println("Ready. Type 0-100, 'rpm <target>', or 'scan'.\n");
 }
 
-// Process temporary serial speed commands and print RPM telemetry every second
 void loop() {
-    handleSerialSpeedCommand();
+  handleSerialSpeedCommand();
+  checkButtons();
 
-    unsigned long currentMillis = millis();
+  unsigned long now = millis();
 
-    // Periodic RPM logging
-    if (currentMillis - previousMillis >= interval) {
-        previousMillis = currentMillis;
-
-        float currentRPM = fan.getRPM();
-        if (fan.isPIDEnabled()) { 
-          currentDuty = fan.updatePID(currentRPM);
-        }
-
-        Serial.printf("[Fan Telemetry] RPM: %.2f | Target RPM: %.1f | Duty: %u%%\n", currentRPM, fan.getTargetRPM(), currentDuty);
+  // Every 1 s: read RPM, run PID, print data
+  if (now - lastRpmTime >= 1010) {
+    lastRpmTime = now;
+    fanRPM = fan.getRPM();
+    if (fanMode == MODE_PID) {
+      fanDuty = fan.updatePID(fanRPM);
     }
+    Serial.printf("[Telemetry] RPM: %.0f | Target: %.0f | Duty: %d%% | T: %.1f C | RH: %.1f %% | Sensor: %s\n",
+                  fanRPM, targetRPM, fanDuty, temperature, humidity, sensorOK ? "OK" : "ERROR");
+  }
+
+  // Every 2 s: read temperature and humidity
+  if (now - lastSensorTime >= 2000) {
+    lastSensorTime = now;
+    readSensor();
+  }
+
+  // Every 30 ms: LED animation
+  if (now - lastLedTime >= 30) {
+    lastLedTime = now;
+    updateLed();
+  }
+
+  // Every 200 ms: refresh OLED
+  if (now - lastDisplayTime >= 200) {
+    lastDisplayTime = now;
+    updateDisplay();
+  }
 }

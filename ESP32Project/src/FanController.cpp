@@ -18,8 +18,16 @@ FanController::FanController(uint8_t pwmPin, uint8_t tachPin, float pulsesPerRev
 // Interrupt handler: increment tachometer pulse counter
 void IRAM_ATTR FanController::handleTachInterrupt() {
     if (_instance != nullptr) {
-        unsigned long count = _instance->_tachPulseCount;
-        _instance->_tachPulseCount = count + 1;
+        // Noise filter (added by Member B): the PWM signal causes very short spikes
+        // on the TACH wire. A real TACH pulse stays LOW for milliseconds and pulses
+        // are more than 1 ms apart, so only count pulses that pass both checks.
+        static unsigned long lastPulseMicros = 0;
+        unsigned long now = micros();
+        if (digitalRead(_instance->_tachPin) == LOW && now - lastPulseMicros > 1000) {
+            lastPulseMicros = now;
+            unsigned long count = _instance->_tachPulseCount;
+            _instance->_tachPulseCount = count + 1;
+        }
     }
 }
 
